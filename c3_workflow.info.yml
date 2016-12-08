@@ -1,0 +1,8 @@
+name: C3 Workflow
+core: 8.x
+description: Some generic customization of workbench_moderation + scheduled_updates
+package: ET
+type: module
+dependencies:
+  - workbench_moderation
+  - scheduled_updates

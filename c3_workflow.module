@@ -1,0 +1,118 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\c3_workflow\CustomEntityModerationForm;
+use Drupal\c3_workflow\Fields;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\c3_workflow\Form\OptionalPublishDateForm;
+use Drupal\inline_entity_form\Element\InlineEntityForm;
+use Drupal\node\NodeForm;
+use Drupal\scheduled_updates\Entity\ScheduledUpdate;
+use Drupal\scheduled_updates\Entity\ScheduledUpdateType;
+use Drupal\workbench_moderation\Form\EntityModerationForm;
+
+/**
+ * Implements hook_entity_field_access().
+ *
+ * - Check access to the publish_date field
+ */
+function c3_workflow_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  if ($operation === 'edit' && $field_definition->getName() === Fields::PUBLICATION_DATE_FIELD) {
+    return AccessResult::allowedIfHasPermission($account, 'set publication date');
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_form_alter()
+ */
+function c3_workflow_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_state->getFormObject() instanceof NodeForm && isset($form[Fields::PUBLICATION_DATE_FIELD])) {
+    $form['#entity_builders'][] = [new OptionalPublishDateForm(), 'buildEntity'];
+
+    // Maybe the referenced entity, doesn't actually exist anymore. In this case
+    // we don't want to set a #type.
+    // @see \Drupal\inline_entity_form\Plugin\Field\FieldWidget\InlineEntityFormSimple::formElement
+    if (!empty($form[Fields::PUBLICATION_DATE_FIELD]['widget'][0]['inline_entity_form'])) {
+      $form[Fields::PUBLICATION_DATE_FIELD]['widget'][0]['inline_entity_form']['#type'] = 'inline_entity_form__optional';
+      $form[Fields::PUBLICATION_DATE_FIELD]['widget'][0]['inline_entity_form']['#process'] = [
+        [InlineEntityForm::class, 'processEntityForm'],
+        [OptionalPublishDateForm::class, 'processInlineEntityForm'],
+      ];
+    }
+  }
+
+  if ($form_state->getFormObject() instanceof EntityModerationForm) {
+    $custom_form = new CustomEntityModerationForm();
+    $custom_form->alter($form, $form_state);
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * - Ensures to set the workflow status to published, when it doesn't have a
+ *   publish date and is on scheduled.
+ */
+function c3_workflow_entity_presave(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface && $entity->hasField(Fields::PUBLICATION_DATE_FIELD) && $entity->hasField('moderation_state')) {
+    if ($entity->moderation_state->target_id == 'scheduled' && $entity->{Fields::PUBLICATION_DATE_FIELD}->isEmpty()) {
+      $entity->moderation_state->target_id = 'published';
+    }
+  }
+}
+
+/**
+ * Implements hook_scheduled_update_delete().
+ */
+function c3_workflow_scheduled_update_delete(ScheduledUpdate $scheduled_update) {
+  $id = $scheduled_update->id();
+  $schedule_update_type = ScheduledUpdateType::load($scheduled_update->bundle());
+
+  // @todo Support potential more entity types than just nodes.
+  if ($schedule_update_type->getUpdateEntityType() !== 'node') {
+    return;
+  }
+
+  // Remove the reference from all referenced nodes.
+  $nids = \Drupal::entityTypeManager()->getStorage($schedule_update_type->getUpdateEntityType())->getQuery()
+    ->allRevisions()
+    ->condition(Fields::PUBLICATION_DATE_FIELD, $id)
+    ->sort('vid', 'DESC')
+    ->pager(0)
+    ->execute();
+
+  /** @var Drupal\workbench_moderation\ModerationInformationInterface $moderation_information */
+  $moderation_information = \Drupal::service('workbench_moderation.moderation_information');
+  $revision = $moderation_information->getLatestRevision('node', reset($nids));
+
+  if ($revision->{Fields::PUBLICATION_DATE_FIELD}->target_id == $id) {
+    $revision->{Fields::PUBLICATION_DATE_FIELD}->target_id = NULL;
+    $revision->setNewRevision(FALSE);
+    $revision->save();
+  }
+
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter()
+ *
+ * - Adds a constrain to ensure the publish_date is in the future.
+ */
+function c3_workflow_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'scheduled_update') {
+    /** @var \Drupal\Core\Field\FieldDefinitionInterface $field */
+    $field = $fields['update_timestamp'];
+    $field->getItemDefinition()->addConstraint('FutureTimestamp', ['bundle' => 'publish_date']);
+  }
+}
